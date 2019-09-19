@@ -31,10 +31,23 @@ DOCUMENTATION = '''
           default: lxc
           vars:
                - name: container_tech
+      container_tech_requires_sudo:
+          description: Container command must be run via sudo
+          type: boolean
+          default: False
+          vars:
+               - name: container_tech_requires_sudo
       container_user:
-          description: Username used when running command inside a container
+          description: Username used when running command inside a container. Ignored when container_become_method = 'ansible_become', set ansible_become_user instead.
+          default: root
           vars:
                - name: container_user
+      container_become_method:
+          description: Method used to become user within container. Set to ansible_become to use the become plugin.
+          choices: ['su', 'ansible_become']
+          default: su
+          vars:
+              - name: container_become_method
       chroot_path:
           description: Path of a chroot host
           vars:
@@ -351,6 +364,9 @@ class Connection(SSH.Connection):
             #                  revise this in the future.
             self.container_tech = 'lxc'
 
+        self.container_tech_requires_sudo = getattr(self._play_context, 'container_tech_requires_sudo', False)
+        self.container_become_method = getattr(self._play_context, 'container_become_method', 'su')
+
         if not hasattr(self._play_context, 'retries'):
             self._play_context.retries = 3
 
@@ -365,6 +381,11 @@ class Connection(SSH.Connection):
         self.container_name = self.get_option('container_name')
         self.container_tech = self.get_option('container_tech')
         self.physical_host = self.get_option('physical_host')
+        self.container_tech_requires_sudo = self.get_option('container_tech_requires_sudo')
+        self.container_cmd_prefix = ''
+        if self.container_tech_requires_sudo:
+            self.container_cmd_prefix = 'sudo '
+        self.container_become_method = self.get_option('container_become_method')
 
         # Check to see if container_user is setup first, if so use that value.
         # If it isn't, then default to 'root'
@@ -405,18 +426,21 @@ class Connection(SSH.Connection):
             # improved somehow...
             _pad = None
             if self.container_tech == 'lxc':
-                _pad = 'lxc-attach --clear-env --name %s' % self.container_name
-            elif self.container_tech == 'nspawn':
+                _pad = self.container_cmd_prefix + 'lxc-attach --clear-env --name %s' % self.container_name
+            elif self.container_tech in ('nspawn', 'docker', 'podman'):
                 _, pid_path = self._pid_lookup(subdir='ns')
-                ns_cmd = 'nsenter ' + self.container_namespaces
+                ns_cmd = self.container_cmd_prefix + 'nsenter ' + self.container_namespaces
                 _pad = ns_cmd.format(path=pid_path)
 
             if _pad:
-                cmd = '%s -- su - %s -c %s' % (
-                    _pad,
-                    self.container_user,
-                    SSH.shlex_quote(cmd)
-                )
+                if self.container_become_method == 'su':
+                    cmd = '%s -- su - %s -c %s' % (
+                        _pad,
+                        self.container_user,
+                        SSH.shlex_quote(cmd)
+                    )
+                else:
+                    cmd = '%s %s' % (_pad, cmd)
 
         elif self._chroot_check():
             chroot_command = 'chroot %s' % self.chroot_path
@@ -477,6 +501,10 @@ class Connection(SSH.Connection):
             lookup_command = (u"lxc-info -Hpn '%s'" % self.container_name)
             if not subdir:
                 subdir = 'root'
+        elif self.container_tech in ('docker', 'podman'):
+            lookup_command = (self.container_cmd_prefix + u"%s inspect --format {{.State.Pid}} '%s'" % (self.container_tech, self.container_name))
+            if not subdir:
+                subdir = 'root'
         else:
             return 1, ''
 
@@ -523,23 +551,10 @@ class Connection(SSH.Connection):
 
     def put_file(self, in_path, out_path):
         """transfer a file from local to remote."""
-        _out_path = out_path
+        _ssh_transfer_method = self._play_context.ssh_transfer_method
         if self._container_check():
-            _out_path = self._container_path_pad(path=_out_path)
-
-        res = super(Connection, self).put_file(in_path, _out_path)
-
-        # NOTE(mnaser): If we're running without a container, we break out
-        #               here to avoid the extra round-trip for the unnecessary
-        #               chown.
-        if not self._container_check():
-            return res
-
-        # NOTE(pabelanger): Because we put_file as remote_user, it is possible
-        # that user doesn't exist inside the container, so use the root user to
-        # chown the file to container_user.
-        if self.container_user != self._play_context.remote_user:
-            _user = self.container_user
-            self.container_user = 'root'
-            self.exec_command('chown %s %s' % (_user, out_path))
-            self.container_user = _user
+            self._play_context.ssh_transfer_method = 'piped'
+        try:
+            return super(Connection, self).put_file(in_path, out_path)
+        finally:
+            self._play_context.ssh_transfer_method = _ssh_transfer_method

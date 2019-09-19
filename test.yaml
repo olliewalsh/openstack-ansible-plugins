@@ -1,0 +1,38 @@
+# Tested on tripleo using:
+# (undercloud) [stack@undercloud-0 ansible]$ ansible-playbook-3 -vvv test.yaml --become --inventory-file tripleo-ansible-inventory.yaml
+- hosts: Compute
+  gather_facts: false
+  vars:
+    ansible_remote_tmp: /tmp/ansible-${USER}
+    container_cli: podman
+    container_tech_requires_sudo: true
+    container_become_method: ansible_become
+    container_tech: "{{ container_cli }}"
+    physical_host: "{{ ansible_host }}"
+  tasks:
+    - command: "whoami"
+      vars:
+        container_name: nova_compute
+        ansible_become_user: nova
+    - command: "whoami"
+      vars:
+        container_name: nova_compute
+    - shell: "whoami | grep nova"
+      vars:
+        container_name: nova_compute
+        ansible_become_user: nova
+    - shell: "whoami | grep root"
+      vars:
+        container_name: nova_compute
+    - copy:
+        content: "foo bar baz"
+        dest: /tmp/foo_nova.txt
+      vars:
+        container_name: nova_compute
+        ansible_become_user: nova
+    - copy:
+        content: "foo bar baz"
+        dest: /tmp/foo_root.txt
+      vars:
+        container_name: nova_compute
+
